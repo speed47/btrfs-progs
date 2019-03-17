@@ -280,28 +280,6 @@ static struct btrfs_ioctl_space_args *load_space_info(int fd, const char *path)
 	return sargs;
 }
 
-/*
- * This function computes the space occupied by a *single* RAID5/RAID6 chunk.
- * The computation is performed on the basis of the number of stripes
- * which compose the chunk, which could be different from the number of devices
- * if a disk is added later.
- */
-static void get_raid56_used(struct chunk_info *chunks, int chunkcount,
-		u64 *raid5_used, u64 *raid6_used)
-{
-	struct chunk_info *info_ptr = chunks;
-	*raid5_used = 0;
-	*raid6_used = 0;
-
-	while (chunkcount-- > 0) {
-		if (info_ptr->type & BTRFS_BLOCK_GROUP_RAID5)
-			(*raid5_used) += info_ptr->size / (info_ptr->num_stripes - 1);
-		if (info_ptr->type & BTRFS_BLOCK_GROUP_RAID6)
-			(*raid6_used) += info_ptr->size / (info_ptr->num_stripes - 2);
-		info_ptr++;
-	}
-}
-
 #define	MIN_UNALOCATED_THRESH	SZ_16M
 static int print_filesystem_usage_overall(int fd, struct chunk_info *chunkinfo,
 		int chunkcount, struct device_info *devinfo, int devcount,
@@ -331,13 +309,15 @@ static int print_filesystem_usage_overall(int fd, struct chunk_info *chunkinfo,
 	double data_ratio;
 	double metadata_ratio;
 	/* logical */
-	u64 raid5_used = 0;
-	u64 raid6_used = 0;
+	u64 r_data_raid56_chunks = 0;
+	u64 l_data_raid56_chunks = 0;
+	u64 r_metadata_raid56_chunks = 0;
+	u64 l_metadata_raid56_chunks = 0;
 	u64 l_global_reserve = 0;
 	u64 l_global_reserve_used = 0;
 	u64 free_estimated = 0;
 	u64 free_min = 0;
-	int max_data_ratio = 1;
+	double max_data_ratio = 1;
 	int mixed = 0;
 
 	sargs = load_space_info(fd, path);
@@ -359,24 +339,29 @@ static int print_filesystem_usage_overall(int fd, struct chunk_info *chunkinfo,
 		ret = 1;
 		goto exit;
 	}
-	get_raid56_used(chunkinfo, chunkcount, &raid5_used, &raid6_used);
 
 	for (i = 0; i < sargs->total_spaces; i++) {
 		int ratio;
 		u64 flags = sargs->spaces[i].flags;
 
+		if ((flags & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA))
+		    == (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA)) {
+			mixed = 1;
+		}
+
 		/*
 		 * The raid5/raid6 ratio depends by the stripes number
-		 * used by every chunk. It is computed separately
+		 * used by every chunk. It is computed separately,
+		 * after we're done with this loop, so skip those.
 		 */
 		if (flags & BTRFS_BLOCK_GROUP_RAID0)
 			ratio = 1;
 		else if (flags & BTRFS_BLOCK_GROUP_RAID1)
 			ratio = 2;
 		else if (flags & BTRFS_BLOCK_GROUP_RAID5)
-			ratio = 0;
+			continue;
 		else if (flags & BTRFS_BLOCK_GROUP_RAID6)
-			ratio = 0;
+			continue;
 		else if (flags & BTRFS_BLOCK_GROUP_DUP)
 			ratio = 2;
 		else if (flags & BTRFS_BLOCK_GROUP_RAID10)
@@ -384,19 +369,12 @@ static int print_filesystem_usage_overall(int fd, struct chunk_info *chunkinfo,
 		else
 			ratio = 1;
 
-		if (!ratio)
-			warning("RAID56 detected, not implemented");
-
 		if (ratio > max_data_ratio)
 			max_data_ratio = ratio;
 
 		if (flags & BTRFS_SPACE_INFO_GLOBAL_RSV) {
 			l_global_reserve = sargs->spaces[i].total_bytes;
 			l_global_reserve_used = sargs->spaces[i].used_bytes;
-		}
-		if ((flags & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA))
-		    == (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA)) {
-			mixed = 1;
 		}
 		if (flags & BTRFS_BLOCK_GROUP_DATA) {
 			r_data_used += sargs->spaces[i].used_bytes * ratio;
@@ -412,6 +390,52 @@ static int print_filesystem_usage_overall(int fd, struct chunk_info *chunkinfo,
 			r_system_used += sargs->spaces[i].used_bytes * ratio;
 			r_system_chunks += sargs->spaces[i].total_bytes * ratio;
 		}
+	}
+
+	/*
+	 * Here we compute the space occupied by every RAID5/RAID6 chunks.
+	 * The computation is performed on the basis of the number of stripes
+	 * which compose each chunk, which could be different from the number of devices
+	 * if a disk is added later, or if the disks are of different sizes..
+	 */
+	struct chunk_info *info_ptr;
+	for (info_ptr = chunkinfo, i = chunkcount; i > 0; i--, info_ptr++) {
+		int flags = info_ptr->type;
+		int nparity;
+
+		if (flags & BTRFS_BLOCK_GROUP_RAID5) {
+			nparity = 1;
+		}
+		else if (flags & BTRFS_BLOCK_GROUP_RAID6) {
+			nparity = 2;
+		}
+		else {
+			// We're only interested in raid56 here
+			continue;
+		}
+
+		if (flags & BTRFS_BLOCK_GROUP_DATA) {
+			r_data_raid56_chunks += info_ptr->size / (info_ptr->num_stripes - nparity);
+			l_data_raid56_chunks += info_ptr->size / info_ptr->num_stripes;
+		}
+		if (flags & BTRFS_BLOCK_GROUP_METADATA) {
+			r_metadata_raid56_chunks += info_ptr->size / (info_ptr->num_stripes - nparity);
+			l_metadata_raid56_chunks += info_ptr->size / info_ptr->num_stripes;
+		}
+	}
+
+	if (l_data_raid56_chunks > 0) {
+		double ratio = (double)r_data_raid56_chunks / l_data_raid56_chunks;
+		r_data_used += r_data_raid56_chunks;
+		r_data_chunks += r_data_raid56_chunks;
+		l_data_chunks += l_data_raid56_chunks;
+		if (ratio > max_data_ratio)
+			max_data_ratio = ratio;
+	}
+	if (l_metadata_raid56_chunks > 0) {
+		r_metadata_used += r_metadata_raid56_chunks;
+		r_metadata_chunks += r_metadata_raid56_chunks;
+		l_metadata_chunks += l_metadata_raid56_chunks;
 	}
 
 	r_total_chunks = r_data_chunks + r_system_chunks;
